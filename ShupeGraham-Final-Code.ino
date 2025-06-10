@@ -8,15 +8,13 @@
 
 // Actuators:
 #define ONBOARD_LED_PIN 7
-#define NEOPIXEL_PIN 10
+#define NEOPIXEL_PIN 0
 #define NUM_NEOPIXELS 2
-#define BUZZER_PIN 6
-#define BUZZER_FREQ 2000
+#define BUZZER_PIN 1
+#define BUZZER_FREQ 1200
 
-// Sensor pins:
-#define ALS_BOTTOM 9
-#define ALS_TOP 1
-#define BUTTON_PIN 12
+// Sensor pins (HTU uses I2C):
+#define LIGHT_SENSOR 9
 
 // Heat index thresholds:
 #define HI_CAUTION 80
@@ -24,13 +22,17 @@
 #define HI_DANGER 103
 #define HI_EX_DANGER 125
 
+#define SUNLIGHT_MIN 600  // Minimum analog reading to be considered sunlight. Adjust this based on your phototransistor.
 
-bool buzzerSilenced = false;
+
 bool neoPixelOn = true;
+bool heaterOn = false;
 
 Adafruit_HTU31D htu = Adafruit_HTU31D();  // Connected to SDA and SCL pins
 uint32_t timestamp;
-uint32_t heaterToggleTimestamp;
+uint32_t heaterTimestamp;
+float prevTemperatureC = 0;
+float prevRelHumidity = 0;
 
 Adafruit_NeoPixel neoPixels(NUM_NEOPIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
@@ -39,42 +41,60 @@ void setup() {
   pinMode(LIGHT_SENSOR, INPUT);
   pinMode(ONBOARD_LED_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT);
-  digitalWrite(BUTTON_PIN, HIGH);
 
   #if DEBUG
   Serial.begin(9600);
+  while (!Serial);  // wait for serial monitor to initialize
   #endif
 
-  htu.begin(0x40);
+  if (!htu.begin(0x40)) {
+    digitalWrite(ONBOARD_LED_PIN, HIGH);
+    #if DEBUG
+    Serial.println("FATAL: could not find HTU sensor");
+    #endif
+    while (1);
+  }
 
   neoPixels.begin();
+  neoPixels.setBrightness(180);
   neoPixels.show();
 
   #if DEBUG
-  Serial.println("Started HTU and Neopixels");
+  Serial.println("Setup complete");
   #endif
 
   timestamp = millis();
+  heaterTimestamp = millis();
 }
 
 
 /*
-Calculates the difference between the two light sensors.
-The larger the difference between the two sensors, the larger the sun level (from 0-10).
+Determines the amount of sunlight hitting the phototransistor.
+Returns 0 to 5 depending on the sun level.
 */
 int getSunLevel() {
-  int topValue = analogRead(ALS_TOP);
-  int bottomValue = analogRead(ALS_BOTTOM);
-  if (topValue - bottomValue > 200) {
-    return (topValue - bottomValue) / 100;
+  int lightValue = analogRead(LIGHT_SENSOR);
+  int sunLevel;
+  if (lightValue - SUNLIGHT_MIN < 0) {
+    sunLevel = 0;
   } else {
-    return 0;
+    // Translate the light level into one of five sunlight levels:
+    sunLevel = (lightValue - SUNLIGHT_MIN) / ((1023 - SUNLIGHT_MIN) / 5);
   }
+
+  #if DEBUG
+  Serial.print(timestamp);
+  Serial.print(" lightValue: ");
+  Serial.print(lightValue);
+  Serial.print(" sunLevel: ");
+  Serial.println(sunLevel);
+  #endif
+
+  return sunLevel;
 }
 
 /*
-Gets the heat index given humidity and temperature.
+Returns the heat index given humidity and temperature.
 The sun level offset is automatically calculated and included in the returned value.
 This relies on the insane heat index calculation formula from the National Weather Service:
 https://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
@@ -82,21 +102,19 @@ https://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
 float getHeatIndex(float tempC, float relHumidity) {
   float tempF = (tempC * 1.8) + 32;
 
-  // The sun level adds an offset to account for sun intensity.
+  // The sun level adds an offset to account for sun intensity
   int sunLevel = getSunLevel();
 
   #if DEBUG
   tempF += DEBUG_TEMPF_OFFSET;
-  Serial.print(timestamp);
-  Serial.print(" sunLevel: ");
-  Serial.println(sunLevel);
   #endif
 
   // Calculate the simple formula first, returning it if the HI < 80:
-  float heatIndex = 0.5 * (tempF + 61.0 + ((tempF - 68.0) * 1.2) + (relHumidity * 0.094)) + sunLevel;
+  float heatIndex = 0.5 * (tempF + 61.0 + ((tempF - 68.0) * 1.2) + (relHumidity * 0.094));
   if (heatIndex < 80.0) {
-    return heatIndex;
+    return heatIndex + sunLevel;
   }
+
   // Since HI >= 80, we have to use the regression formula:
   heatIndex = -42.379 + 2.04901523*tempF+ 10.14333127*relHumidity - 0.22475541*tempF*relHumidity
    - 0.00683783*tempF*tempF - 0.05481717*relHumidity*relHumidity + 0.00122874*tempF*tempF*relHumidity
@@ -112,35 +130,57 @@ float getHeatIndex(float tempC, float relHumidity) {
   return heatIndex + sunLevel;
 }
 
-void turnOnHeater()
-
 void loop() {
-  if (digitalRead(BUTTON_PIN) == 0) {
-    buzzerSilenced = true;
+  // Cycle the heater every 5 seconds if humidity > 70%:
+  if (millis() - heaterTimestamp > 5000 && prevRelHumidity > 70) {
+    heaterOn = !heaterOn;
+
+    #if DEBUG
+    Serial.print(timestamp);
+    if (heaterOn) {
+      Serial.println("Turning heater on");
+    } else {
+      Serial.println("Turning heater off");
+    }
+    #endif
+
+    if (!htu.enableHeater(heaterOn)) {
+      #if DEBUG
+      Serial.println("ERROR: could not send enableHeater command");
+      #endif
+    }
+    heaterTimestamp = millis();
   }
 
-  if (millis() - timestamp < 500) {
-    // To preserve battery life, only check sensor data every 0.5 seconds
+  if (millis() - timestamp < 500 || heaterOn) {
+    // For better efficiency, only check sensor data every 0.5 seconds
     return;
   }
   timestamp = millis();
 
-  if ()
-
-  sensors_event_t humidity, temp;
-  htu.getEvent(&humidity, &temp);
-  int heatIndex = getHeatIndex(temp.temperature, humidity.relative_humidity);
+  // Get heat index:
+  sensors_event_t humidity_event, temp_event;
+  float tempC, relHumidity;
+  if (!htu.getEvent(&humidity_event, &temp_event) || temp_event.temperature == 0 || humidity_event.relative_humidity == 0) {
+    // Failed to read sensor data, so just use the last known data
+    tempC = prevTemperatureC;
+    relHumidity = prevRelHumidity;
+  } else {
+    tempC = temp_event.temperature;
+    relHumidity = humidity_event.relative_humidity;
+    prevTemperatureC = tempC;
+    prevRelHumidity = relHumidity;
+  }
+  float heatIndex = getHeatIndex(tempC, relHumidity);
 
   #if DEBUG
   Serial.print(timestamp);
   Serial.print(" Humidity (%): ");
-  Serial.print(humidity.relative_humidity);
+  Serial.print(humidity_event.relative_humidity);
   Serial.print(" Temperature (C): ");
-  Serial.print(temp.temperature);
+  Serial.print(temp_event.temperature);
   Serial.print(" Heat Index: ");
   Serial.print(heatIndex);
-  Serial.print(" Buzzer silenced? ");
-  Serial.println(buzzerSilenced);
   #endif
 
   uint32_t color;
@@ -154,16 +194,13 @@ void loop() {
       color = neoPixels.Color(255, 0, 0);
     }
     neoPixelOn = !neoPixelOn;
-    if (!buzzerSilenced) {
-      tone(BUZZER_PIN, BUZZER_FREQ, 600);
-    }
+    tone(BUZZER_PIN, BUZZER_FREQ, 600);
   } else if (heatIndex > HI_DANGER) {
-    color = neoPixels.Color(255, 100, 0);
-    buzzerSilenced = false;
+    color = neoPixels.Color(255, 50, 0);
   } else if (heatIndex > HI_EX_CAUTION) {
-    color = neoPixels.Color(255, 200, 0);
+    color = neoPixels.Color(255, 220, 0);
   } else if (heatIndex > HI_CAUTION) {
-    color = neoPixels.Color(255, 255, 0);
+    color = neoPixels.Color(180, 255, 0);
   } else {
     color = neoPixels.Color(0, 255, 0);
   }
@@ -171,8 +208,6 @@ void loop() {
   neoPixels.fill(color);
   neoPixels.show();
 }
-
-
 
 
 
